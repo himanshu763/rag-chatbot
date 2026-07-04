@@ -1,134 +1,212 @@
 # Enhancement Options — RAG Library Evolution
 
-Brainstorm doc. Lists what *could* be done in each area before we pick one to spec in detail.
-Not a committed design — options only, with rough complexity/dependency notes.
+Brainstorm doc. Options only — not a committed design. Lists what *could* be done in
+each area, with complexity/dependency/scale notes, so we can pick what to spec first.
+
+**Verified against code** (not just README). Corrections from first draft noted inline.
 
 ---
 
-## 1. Library-ification
+## 0. Framing Corrections (read first)
 
-Goal: turn this from "one app" into a base others can import to build specialized RAG systems.
+Three things the design must be honest about:
 
-- **Plugin interfaces (core work)**
-  - `Loader` ABC — current loaders (Web/PDF/DOCX/CSV/Excel/Text) become implementations, not hardcoded dispatch
-  - `Embedder` protocol — support OpenAI, Azure, local HuggingFace, Cohere, swappable per instance
-  - `VectorStore` abstraction — Chroma today, pluggable pgvector/Qdrant/Pinecone later
-  - `LLMProvider` abstraction — OpenAI/Azure today; add Anthropic/local model backends
-  - `Reranker` abstraction — cross-encoder / LLM-rerank already exist as a `reranker_type` switch; formalize as interface
-- **Config overhaul**
-  - Current `config.py` is a process-wide singleton (`settings = Settings()`) — blocks multi-instance/multi-tenant use
-  - Move to per-instance config object passed into a facade, env-vars become defaults only
-- **Public API facade**
-  - Single entry class, e.g. `RagPipeline(config).ingest(source)` / `.query(text)` / `.stream(text)`
-  - `app.py` / `ingest.py` become thin reference clients built on the library, not the library itself
-- **Extension hooks**
-  - Custom chunking strategy injection, custom prompt templates, custom confidence policy
-- **Multi-tenancy**
-  - Namespace/collection-per-tenant support in vector store + BM25 index
-- **Packaging**
-  - `pyproject.toml`, versioned package, optional publish to private/PyPI index
-  - Split `requirements.txt` into core vs. optional extras (e.g. `[web]`, `[docx]`, `[graph]`)
-- **Testing harness**
-  - Fake/mock LLM + embedder for unit tests without API calls; contract tests per interface
+1. **This is NOT built on langchain.** `requirements.txt` uses raw libs only
+   (`openai`, `sentence-transformers`, `chromadb`, `rank-bm25`, `playwright`, `bs4`,
+   `PyMuPDF`, `python-docx`, `openpyxl`, `pymongo`). No langchain / llama-index.
+   So the goal is a langchain **alternative**, not a wrapper.
+   - **Achievable edge over langchain/llama-index:** minimal deps, transparent +
+     hackable core, opinionated production defaults baked in (confidence gating,
+     hybrid retrieval, fallback ladder), RAG + CAG + graph as first-class citizens.
+   - **NOT the edge:** feature count. Those frameworks are mature; won't out-feature
+     them. Sell "focused + transparent," not "bigger."
 
-**Dependency note:** everything below is easier to bolt on cleanly if this is done first — new features become new interface implementations instead of more special-casing in existing files.
+2. **"App-first then library" is fine — the foundation is the problem.** Good libraries
+   get *extracted* from real usage. Keep the app as the driver. But this repo runs on
+   module-level global state (`settings` singleton `config.py:71`; `_collection`,
+   `_bm25_cache`, `_embed_client` in `pipeline.py`; `_reranker`, `_llm_rerank_client`
+   in `engine.py`). Every new feature added now wires *into those globals*, turning the
+   eventual library conversion into a rewrite. **Kill the globals + define interfaces
+   before layering features** — ~10× cheaper now than after 4 more features deepen it.
+
+3. **"Billions of documents" is a different product tier.** Current stack is single-node
+   and does not scale past low millions (see §Scale Tiers). Billions = *replace*
+   components, not extend them. Doc tiers this explicitly instead of pretending the
+   current code scales.
 
 ---
 
-## 2. Freshness / Staleness Checker (chunks)
+## Scale Tiers
 
-Goal: know when retrieved info might be outdated, and act on it.
+| Tier | Corpus size | Vector store | Keyword | Notes |
+|------|-------------|--------------|---------|-------|
+| **T1** | thousands → low millions | ChromaDB (single-node) | in-memory `rank-bm25` | current stack, after fixing the rebuild-everything BM25 |
+| **T2** | 10M → billions | Qdrant / Milvus / Vespa (distributed, quantized) | OpenSearch / Elasticsearch | *replaces* T1 components via the `VectorStore` / `KeywordIndex` interfaces |
 
-- **Metadata capture at ingest**
-  - `source_fetched_at`, `source_last_modified` (HTTP `Last-Modified`/`ETag` for web, file mtime for local files), `ingested_at`
-  - Content hash per source (already have `content_hash` per commit history — extend to per-chunk)
-- **Staleness scoring**
-  - Age-based decay function (configurable half-life per source type — web pages decay faster than static PDFs)
-  - Per-source TTL overrides (e.g. pricing page = 7 days, static whitepaper = 1 year)
-- **Detection / recheck**
-  - Scheduled recrawl for web sources — compare hash/ETag, only re-embed on actual change
-  - File-watch or manual `--refresh` flag for local files
-  - Idempotent re-ingest already exists (replaces old chunks) — extend to skip if hash unchanged (save embedding cost)
-- **Surfacing at query time**
-  - Attach staleness badge to citations ("last verified 42 days ago")
-  - Fold staleness into confidence ladder: fresh+high-sim → HIGH; stale+high-sim → downgrade to MEDIUM with a note
-- **Lifecycle**
-  - Background sweep job (APScheduler/Celery) flags stale chunks; optional auto re-ingest queue
-  - Keep chunk version history instead of hard overwrite (enables "what changed" diffing)
+**Concrete T1 blockers found in code (must fix even to reach low-millions):**
+- `_get_bm25_index()` (`engine.py:77`) — `col.get(...)` loads the **entire corpus into
+  RAM** and rebuilds the BM25 index whenever `col.count()` changes. O(all docs) per
+  rebuild. Dies well before billions.
+- `list_sources()` (`pipeline.py:191`) and `_migrate_schema_if_needed()`
+  (`pipeline.py:65`) full-scan the whole collection.
+- `chromadb.PersistentClient` is single-node, single-process.
 
-**Dependency note:** mostly additive to ingestion schema + orchestrator confidence step — low coupling to the other three areas.
+The plug-and-play interfaces below are what make the T1→T2 swap possible without a rewrite.
+
+---
+
+## The Spine: Retriever-Agnostic Chunk Schema + Module Registry
+
+This is the organizing principle everything else hangs off (user's core insight:
+"store chunks so any retriever — graph, dense, bm25, others — can use them,
+plug-and-play module selection").
+
+### A. One chunk record, every retrieval method
+
+Store each chunk once, with everything any retriever might need:
+
+```
+ChunkRecord:
+  chunk_id            # stable id
+  raw_text            # what BM25 tokenizes + what LLM reads (exists today)
+  enriched_text       # context-prefixed text used for embedding (exists today, not stored separately)
+  embedding           # dense vector (exists today)
+  parent_text         # parent-child expansion (exists today, in metadata)
+  section_path        # hierarchy: doc > section > subsection (chunker has this, underused)
+  entities            # extracted entities/keywords → graph nodes (NEW)
+  edges               # links to related chunk_ids (shared entity / xref / adjacency) (NEW)
+  provenance          # source, source_type, url/path, page/loc (partial today)
+  freshness           # fetched_at, ingested_at, source_last_modified, ttl (NEW)
+  hashes              # content_hash (per-chunk) + source_hash (per-doc) — BOTH EXIST today
+  schema_version      # exists today
+```
+
+Correction from first draft: per-chunk `content_hash` and per-source `source_hash`
+**already exist** (`pipeline.py:165-166`). The genuinely missing pieces are
+**timestamps/TTL, entities, and edges**.
+
+### B. Module registry (plug-and-play)
+
+User picks which implementations to wire, per instance:
+
+```
+RagPipeline(
+  loaders   = [WebLoader, PDFLoader, ...],   # or auto-dispatch by type
+  chunker   = StructureAwareChunker(...),
+  embedder  = OpenAIEmbedder / AzureEmbedder / LocalHFEmbedder / ...,
+  store     = ChromaStore / QdrantStore / ...,           # VectorStore interface
+  keyword   = BM25Index / OpenSearchIndex / None,        # KeywordIndex interface
+  retrievers= [DenseRetriever, BM25Retriever, GraphRetriever],  # composable
+  fusion    = RRFFusion(...),
+  reranker  = CrossEncoderReranker / LLMReranker / None,
+  generator = OpenAIGenerator / AnthropicGenerator / ...,
+  cache     = SemanticCache / None,          # CAG
+  policy    = ConfidencePolicy(...),         # gating/fallback ladder
+)
+```
+
+Retrievers are the key composable: each takes the query + the shared chunk store and
+returns scored `chunk_id`s. Dense, BM25, and Graph all conform to one `Retriever`
+interface → user enables any subset → fusion merges them. Adding a new retrieval method
+= add one class, no core changes.
+
+---
+
+## 1. Library-ification (the enabling work)
+
+- **Kill global state** — per-instance config + injected store/embedder/clients
+  (removes every `_singleton` and the `settings = Settings()` global).
+- **Define interfaces:** `Loader`, `Chunker`, `Embedder`, `VectorStore`, `KeywordIndex`,
+  `Retriever`, `Fusion`, `Reranker`, `Generator`, `Cache`, `ConfidencePolicy`.
+- **Facade:** `RagPipeline(config).ingest(source)` / `.query(text)` / `.stream(text)`.
+  `app.py` / `ingest.py` become thin reference clients on top.
+- **Config:** env-vars become defaults, not the source of truth; config is an object
+  passed in.
+- **Packaging:** `pyproject.toml`, versioned; `requirements` split into core + extras
+  (`[web]`, `[docx]`, `[graph]`, `[qdrant]`…) so users install only what they enable.
+- **Test harness:** fake embedder + fake LLM (no API calls); one contract test per
+  interface so any implementation is verifiable.
+
+**Why first:** every feature below is a new interface implementation *if* the seams exist,
+or another special-case wired into globals *if* they don't.
+
+---
+
+## 2. Freshness / Staleness Checker
+
+- **Capture at ingest (missing today):** `fetched_at`, `ingested_at`,
+  `source_last_modified` (HTTP `Last-Modified`/`ETag` for web, file mtime for local),
+  optional per-source `ttl`.
+- **Change detection (partly exists):** ingest already skips unchanged content via
+  `source_hash` (`pipeline.py:138`). Extend to web recrawl using `ETag`/`Last-Modified`
+  so unchanged pages skip re-embedding (saves cost).
+- **Staleness scoring:** age-decay with configurable half-life per source type
+  (pricing page decays fast, whitepaper slow); TTL overrides.
+- **Surface at query time:** staleness on citations ("verified 42 days ago"); fold into
+  confidence ladder (stale + high-sim → downgrade HIGH→MEDIUM with a note).
+- **Lifecycle:** background sweep flags stale chunks → optional auto re-ingest queue;
+  optional chunk version history for "what changed" diffing.
+
+**Coupling:** additive to chunk schema + confidence step. Low. Enables safe CAG
+invalidation later.
 
 ---
 
 ## 3. RAG + Graph: Graph-Based Chunk Ordering
 
-Goal: use relationships between chunks (not just vector/BM25 score) to select and order context.
+- **Build graph:** entity/keyword extraction per chunk (NER or LLM) → nodes; edges from
+  shared entities, explicit xrefs, and existing section/parent-child hierarchy (chunker
+  tracks hierarchy already — currently unused for traversal). Cross-document edges link
+  the same entity across sources.
+- **Storage:** T1 = `networkx` in-memory (or edge-lists in chunk metadata, graph built at
+  query time). T2 = Neo4j only if scale demands (own ops burden).
+- **Retrieve:** seed from existing dense+BM25+RRF+rerank pipeline, expand 1–2 hops to pull
+  related-but-not-lexically-similar chunks, re-rank expanded set.
+- **Order context** in document/section reading order, not pure score-sort.
+- **Bonus:** community detection → topic clusters; reuse repo's existing `graphify-out`
+  graph-viz pattern for debugging retrieval graphs.
 
-- **Graph construction**
-  - Entity/keyword extraction per chunk (NER model or LLM-based) → nodes
-  - Edges: shared entities, explicit cross-references, and existing section/parent-child hierarchy (chunker already tracks this — currently unused for graph traversal)
-  - Cross-document edges: same entity mentioned in different sources link across docs
-- **Storage options**
-  - `networkx` in-memory, rebuilt or cached per collection (fine up to tens of thousands of chunks)
-  - Dedicated graph DB (Neo4j) if scale demands it — bigger lift, own ops burden
-  - Lightweight middle ground: store edge lists as Chroma metadata, build graph in-memory at query time
-- **Retrieval integration**
-  - Seed set from existing vector+BM25+RRF+cross-encoder pipeline (unchanged)
-  - Expand seeds via 1–2 hop graph neighbors before final context assembly → pulls in related-but-not-lexically-similar chunks
-  - Re-rank expanded set (reuse existing reranker)
-- **Context ordering**
-  - Assemble context in document/section order (respecting hierarchy) rather than pure score-sort — closer to how a human would read related sections
-- **Bonus**
-  - Community detection (Louvain etc.) → auto-cluster chunks into topics for a browsable "topics" view
-  - `graphify-out/graph.html`-style visualization for debugging retrieval graphs (repo already has a graph visualizer pattern from the graphify experiment — could be repurposed)
-
-**Dependency note:** touches `retrieval/engine.py` directly; benefits from library-ification's `VectorStore`/`Embedder` interfaces being stable first so graph layer isn't built against a moving target.
+**Coupling:** implemented as a `GraphRetriever` conforming to the `Retriever` interface →
+needs interfaces (§1) stable first.
 
 ---
 
 ## 4. CAG: Cache-Augmented Generation
 
-Goal: skip retrieval and/or generation entirely on repeat or near-duplicate queries.
+- **Layered cache:** (1) exact-match `hash(query + source-set)` → response;
+  (2) semantic cache — embed query, match against recent queries (catches paraphrases);
+  (3) miss → full pipeline.
+- **Provider prompt/prefix caching:** pin system prompt + hot context blocks as a cached
+  prefix (Anthropic / OpenAI prompt caching) → cheaper repeat queries on same doc set.
+- **Invalidation:** tie cache entries to source version/hash from §2 → auto-invalidate on
+  content change; TTL fallback.
+- **Storage:** Redis (shared/multi-instance) or local dict/SQLite (dev).
+- **Observability:** hit rate + cost/latency saved (proves the feature earns its complexity).
 
-- **Layered cache strategy**
-  1. Exact-match cache: `hash(query + context/source-set)` → cached response (fastest, free)
-  2. Semantic cache: embed incoming query, check similarity against recent query cache — catches paraphrases ("cost?" vs "how much does it cost?")
-  3. Miss → full pipeline (current behavior)
-- **Context/prompt caching**
-  - If provider supports prompt/prefix caching (Anthropic prompt caching, OpenAI prompt caching), pin the system prompt + frequently-used context blocks as a cached prefix — cuts cost/latency on repeat queries against the same doc set
-- **Invalidation**
-  - Tie cache entries to source version/hash from the freshness checker (#2) — auto-invalidate when underlying content changes
-  - TTL fallback even without explicit invalidation signal
-- **Storage**
-  - Redis for shared/multi-instance cache (already on README's production-upgrade list)
-  - SQLite/local dict for single-instance/dev use
-- **Observability**
-  - Track cache hit rate, estimated cost/latency saved — useful metric to prove the feature earns its complexity
-
-**Dependency note:** most valuable once freshness checker (#2) exists (for safe invalidation) and graph/retrieval (#3) is stable (so what's being cached isn't still changing shape).
+**Coupling:** most valuable *after* §2 (safe invalidation) and §3 (stable retrieval shape).
 
 ---
 
-## 5. Ops-Hardening Backlog (already in README, unchanged)
+## 5. Ops-Hardening Backlog (from README, unchanged)
 
-Not re-scoped here — just the existing list for reference when sequencing:
-
-- Redis (session store / cache backend)
-- PostgreSQL + pgvector (>1M chunks)
-- Celery (async ingestion queue)
-- Elasticsearch (BM25 at scale)
-- Auth (Streamlit authenticator / OAuth proxy)
-- Monitoring (Prometheus/Grafana)
-- Rate limiting (per-user query caps)
+Redis · PostgreSQL+pgvector · Celery (async ingest) · Elasticsearch (BM25 at scale) ·
+Auth · Monitoring (Prometheus/Grafana) · Rate limiting. Pick opportunistically as real
+deployment needs arise. Several overlap with T2 in the Scale Tiers table.
 
 ---
 
-## Suggested Build Order (recommendation, not decided)
+## Recommended First Slice
 
-1. **Library-ification** — stable interfaces first, everything else builds on the seams
-2. **Freshness/staleness** — schema-level, low coupling, unlocks safe cache invalidation later
-3. **Graph-based chunk ordering** — changes retrieval engine
-4. **CAG** — changes generation path, most valuable once 2 and 3 are stable
-5. **Ops-hardening** — pick items opportunistically as real scale/deployment needs arise
+Regardless of app-first vs library-first, the cheap-now/expensive-later work that
+**everything else depends on** is one bounded slice:
 
-Open question for next step: which of 1–4 do we spec first?
+> **Kill global state + define the retriever-agnostic `ChunkRecord` schema + the core
+> `Retriever` / `VectorStore` / `Embedder` interfaces**, keeping the existing app working
+> on top as the driver/reference client.
+
+This unblocks 2, 3, and 4 (each becomes a clean plug-in), fixes the multi-instance blocker,
+and is verifiable with the existing app end-to-end. It does **not** yet touch billions-scale
+(T2) — that's a later, separate swap enabled by these same interfaces.
+
+**Open question for next step:** spec that first slice, or spec one of the visible features
+(freshness / graph / CAG) first as a vertical proof-of-concept?
