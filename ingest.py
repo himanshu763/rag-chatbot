@@ -106,13 +106,13 @@ def load_files() -> list[Path]:
 
 
 def run(urls: list[str], files: list[Path]) -> None:
-    from ingestion.pipeline import IngestionPipeline
+    from rag import RagConfig, RagPipeline
 
     if not urls and not files:
         logger.warning("Nothing to ingest. Add URLs to data/urls.txt or drop files in data/")
         sys.exit(0)
 
-    pipeline = IngestionPipeline()
+    pipeline = RagPipeline(RagConfig.from_env())
     results = []
 
     for url in urls:

@@ -1,43 +1,33 @@
-"""
-Source loaders — extract structured text from web pages, PDFs, DOCX, CSV, Excel, and plain text.
-Each returns a RawDocument with text, sections, and metadata.
+"""Source loaders — extract structured text from web pages, PDFs, DOCX, CSV,
+Excel, and plain text. Each returns a RawDocument (text + sections + metadata).
+
+Web loaders take a RagConfig (SSL verify, playwright toggle); file loaders don't
+need config. Heavy deps (fitz, docx, openpyxl, playwright) are imported lazily so
+the core library installs without them.
 """
 from __future__ import annotations
+
 import csv
-import hashlib
 import logging
 import os
 import re
-from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
-import fitz  # PyMuPDF
-import requests
-import urllib3
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-from bs4 import BeautifulSoup
-from bs4.element import NavigableString
-from docx import Document as DocxDocument
+from rag.config import RagConfig
+from rag.types import RawDocument
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class RawDocument:
-    text: str
-    metadata: dict = field(default_factory=dict)
-    sections: list[dict] = field(default_factory=list)
+def _build_session(verify: bool):
+    """requests session with retry, explicit proxy from env, and SSL config."""
+    import requests
+    import urllib3
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
 
-    @property
-    def content_hash(self) -> str:
-        return hashlib.sha256(self.text.encode()).hexdigest()[:16]
-
-
-def _build_session(verify: bool) -> requests.Session:
-    """Session with retry, explicit proxy from env, and SSL config."""
     if not verify:
         urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -47,12 +37,8 @@ def _build_session(verify: bool) -> requests.Session:
         if val:
             proxies[scheme] = val
 
-    retry = Retry(
-        total=3,
-        backoff_factor=1,
-        status_forcelist=[429, 500, 502, 503, 504],
-        allowed_methods=["GET"],
-    )
+    retry = Retry(total=3, backoff_factor=1,
+                  status_forcelist=[429, 500, 502, 503, 504], allowed_methods=["GET"])
     adapter = HTTPAdapter(max_retries=retry)
     session = requests.Session()
     session.mount("http://", adapter)
@@ -61,24 +47,40 @@ def _build_session(verify: bool) -> requests.Session:
     if proxies:
         session.proxies.update(proxies)
     session.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        )
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) "
+                       "Chrome/124.0.0.0 Safari/537.36")
     })
     return session
+
+
+def _file_times(path: str) -> dict:
+    """fetched_at (now) + source_last_modified (file mtime), as ISO strings."""
+    now = datetime.now(timezone.utc).isoformat()
+    try:
+        mtime = datetime.fromtimestamp(os.path.getmtime(path), tz=timezone.utc).isoformat()
+    except OSError:
+        mtime = ""
+    return {"source_fetched_at": now, "source_last_modified": mtime}
 
 
 class WebLoader:
     STRIP_TAGS = {"nav", "footer", "header", "aside", "script", "style", "noscript", "form"}
     _NAV_RE = re.compile(r'(Previous|Next)\s*$', re.MULTILINE)
 
+    def __init__(self, config: RagConfig | None = None):
+        self.config = config or RagConfig()
+
     def load(self, url: str) -> RawDocument:
-        from config import settings
-        session = _build_session(settings.web_ssl_verify)
+        from bs4 import BeautifulSoup
+        session = _build_session(self.config.web_ssl_verify)
         resp = session.get(url, timeout=30)
         resp.raise_for_status()
+        fetched = {
+            "source_fetched_at": datetime.now(timezone.utc).isoformat(),
+            "source_last_modified": resp.headers.get("Last-Modified", ""),
+            "etag": resp.headers.get("ETag", ""),
+        }
         soup = BeautifulSoup(resp.text, "html.parser")
         for tag in soup.find_all(self.STRIP_TAGS):
             tag.decompose()
@@ -97,24 +99,22 @@ class WebLoader:
         return RawDocument(
             text=full_text,
             metadata={
-                "source_type": "web",
-                "source": url,
+                "source_type": "web", "source": url,
                 "title": (soup.title.string.strip() if soup.title and soup.title.string else urlparse(url).netloc),
                 "ingested_at": datetime.now(timezone.utc).isoformat(),
+                **fetched,
             },
             sections=sections,
         )
 
     def _extract_sections(self, el) -> list[dict]:
+        from bs4.element import NavigableString
         sections, heading, anchor, parts = [], "", "", []
         for child in el.descendants:
             if child.name and child.name in ("h1", "h2", "h3", "h4", "h5", "h6"):
                 if parts:
-                    sections.append({
-                        "heading": heading,
-                        "anchor": anchor,
-                        "text": self._clean(" ".join(parts).strip()),
-                    })
+                    sections.append({"heading": heading, "anchor": anchor,
+                                     "text": self._clean(" ".join(parts).strip())})
                     parts = []
                 heading = child.get_text(strip=True)
                 anchor = child.get("id", "") or ""
@@ -123,11 +123,8 @@ class WebLoader:
                 if t and child.parent.name not in ("h1", "h2", "h3", "h4", "h5", "h6"):
                     parts.append(t)
         if parts:
-            sections.append({
-                "heading": heading,
-                "anchor": anchor,
-                "text": self._clean(" ".join(parts).strip()),
-            })
+            sections.append({"heading": heading, "anchor": anchor,
+                             "text": self._clean(" ".join(parts).strip())})
         return sections
 
     @classmethod
@@ -140,36 +137,30 @@ class WebLoader:
 
 class PlaywrightWebLoader(WebLoader):
     """Playwright HTTP-only loader — no browser, works behind corp proxy.
-    Activate with USE_PLAYWRIGHT_REQUESTS=true in .env.
-    Requires: pip install playwright && playwright install chromium
-    Proxy: set HTTP_PROXY / HTTPS_PROXY env vars (Playwright picks them up automatically).
+    Activate with USE_PLAYWRIGHT_REQUESTS=true. Proxy via HTTP_PROXY/HTTPS_PROXY env.
     """
 
     def load(self, url: str) -> RawDocument:
         try:
             from playwright.sync_api import sync_playwright
         except ImportError:
-            raise ImportError(
-                "playwright not installed: pip install playwright && playwright install chromium"
-            )
+            raise ImportError("playwright not installed: pip install playwright && playwright install chromium")
+        from bs4 import BeautifulSoup
 
         try:
             import certifi
             os.environ.setdefault("SSL_CERT_FILE", certifi.where())
             os.environ.setdefault("REQUESTS_CA_BUNDLE", certifi.where())
         except ImportError:
-            pass  # ignore_https_errors covers corp proxy MITM without certifi
+            pass
 
         parsed = urlparse(url)
         base_url = f"{parsed.scheme}://{parsed.netloc}"
         path = url[len(base_url):] or "/"
 
         with sync_playwright() as p:
-            ctx = p.request.new_context(
-                base_url=base_url,
-                ignore_https_errors=True,
-                extra_http_headers={"User-Agent": "RAGBot/1.0"},
-            )
+            ctx = p.request.new_context(base_url=base_url, ignore_https_errors=True,
+                                        extra_http_headers={"User-Agent": "RAGBot/1.0"})
             try:
                 resp = ctx.get(path)
                 html = resp.text()
@@ -179,7 +170,6 @@ class PlaywrightWebLoader(WebLoader):
         soup = BeautifulSoup(html, "html.parser")
         for tag in soup.find_all(self.STRIP_TAGS):
             tag.decompose()
-
         main = soup.find("main") or soup.find("article") or soup.find("body") or soup
         sections = self._extract_sections(main)
         full_text = "\n\n".join(
@@ -193,18 +183,16 @@ class PlaywrightWebLoader(WebLoader):
             )
         return RawDocument(
             text=full_text,
-            metadata={
-                "source_type": "web",
-                "source": url,
-                "title": (soup.title.string.strip() if soup.title and soup.title.string else parsed.netloc),
-                "ingested_at": datetime.now(timezone.utc).isoformat(),
-            },
+            metadata={"source_type": "web", "source": url,
+                      "title": (soup.title.string.strip() if soup.title and soup.title.string else parsed.netloc),
+                      "ingested_at": datetime.now(timezone.utc).isoformat()},
             sections=sections,
         )
 
 
 class PDFLoader:
     def load(self, path: str) -> RawDocument:
+        import fitz  # PyMuPDF
         doc = fitz.open(path)
         sections, parts = [], []
         for i, page in enumerate(doc, 1):
@@ -216,13 +204,15 @@ class PDFLoader:
         return RawDocument(
             text="\n\n".join(parts),
             metadata={"source_type": "pdf", "source": path, "title": Path(path).stem,
-                       "pages": len(sections), "ingested_at": datetime.now(timezone.utc).isoformat()},
+                      "pages": len(sections), "ingested_at": datetime.now(timezone.utc).isoformat(),
+                      **_file_times(path)},
             sections=sections,
         )
 
 
 class DocxLoader:
     def load(self, path: str) -> RawDocument:
+        from docx import Document as DocxDocument
         doc = DocxDocument(path)
         sections, heading, parts = [], "", []
         for para in doc.paragraphs:
@@ -252,7 +242,8 @@ class DocxLoader:
         return RawDocument(
             text=full,
             metadata={"source_type": "docx", "source": path, "title": Path(path).stem,
-                       "ingested_at": datetime.now(timezone.utc).isoformat()},
+                      "ingested_at": datetime.now(timezone.utc).isoformat(),
+                      **_file_times(path)},
             sections=sections,
         )
 
@@ -263,14 +254,10 @@ class CSVLoader:
     def load(self, path: str) -> RawDocument:
         rows = self._read(path)
         if not rows:
-            return RawDocument(
-                text="",
-                metadata={"source_type": "csv", "source": path, "title": Path(path).stem},
-            )
+            return RawDocument(text="", metadata={"source_type": "csv", "source": path, "title": Path(path).stem})
 
         headers = list(rows[0].keys())
         sections: list[dict] = []
-
         for i in range(0, len(rows), self._GROUP_SIZE):
             batch = rows[i:i + self._GROUP_SIZE]
             lines = []
@@ -284,19 +271,14 @@ class CSVLoader:
             sections.append({"heading": heading, "text": "\n".join(lines)})
 
         full_text = "\n\n".join(
-            (f"## {s['heading']}\n{s['text']}" if s["heading"] else s["text"])
-            for s in sections
+            (f"## {s['heading']}\n{s['text']}" if s["heading"] else s["text"]) for s in sections
         )
         return RawDocument(
             text=full_text,
-            metadata={
-                "source_type": "csv",
-                "source": path,
-                "title": Path(path).stem,
-                "columns": ", ".join(headers),
-                "row_count": len(rows),
-                "ingested_at": datetime.now(timezone.utc).isoformat(),
-            },
+            metadata={"source_type": "csv", "source": path, "title": Path(path).stem,
+                      "columns": ", ".join(headers), "row_count": len(rows),
+                      "ingested_at": datetime.now(timezone.utc).isoformat(),
+                      **_file_times(path)},
             sections=sections,
         )
 
@@ -322,7 +304,6 @@ class ExcelLoader:
 
         wb = openpyxl.load_workbook(path, read_only=True, data_only=True)
         sections: list[dict] = []
-
         for sheet_name in wb.sheetnames:
             ws = wb[sheet_name]
             raw_rows = [
@@ -333,8 +314,6 @@ class ExcelLoader:
             if not raw_rows:
                 continue
 
-            # If first row is a title/merged row (≥50% empty cells), skip it
-            # and use next row as headers
             def _is_title_row(r: list) -> bool:
                 non_empty = sum(1 for c in r if c)
                 return len(r) > 1 and non_empty <= max(1, len(r) // 2)
@@ -353,11 +332,7 @@ class ExcelLoader:
                 lines = []
                 for row in batch:
                     if len(headers) == len(row):
-                        # Skip pairs where header is empty — use value alone
-                        parts = [
-                            f"{h}: {v}" if h else v
-                            for h, v in zip(headers, row) if v
-                        ]
+                        parts = [f"{h}: {v}" if h else v for h, v in zip(headers, row) if v]
                     else:
                         parts = [v for v in row if v]
                     if parts:
@@ -368,22 +343,17 @@ class ExcelLoader:
                 heading = f"{sheet_name} — rows {i + 2}–{end_row + 1}"
                 sections.append({"heading": heading, "text": "\n".join(lines)})
 
-        sheet_count = len(wb.sheetnames)  # read before close
+        sheet_count = len(wb.sheetnames)
         wb.close()
 
         full_text = "\n\n".join(
-            (f"## {s['heading']}\n{s['text']}" if s["heading"] else s["text"])
-            for s in sections
+            (f"## {s['heading']}\n{s['text']}" if s["heading"] else s["text"]) for s in sections
         )
         return RawDocument(
             text=full_text,
-            metadata={
-                "source_type": "excel",
-                "source": path,
-                "title": Path(path).stem,
-                "sheets": sheet_count,
-                "ingested_at": datetime.now(timezone.utc).isoformat(),
-            },
+            metadata={"source_type": "excel", "source": path, "title": Path(path).stem,
+                      "sheets": sheet_count, "ingested_at": datetime.now(timezone.utc).isoformat(),
+                      **_file_times(path)},
             sections=sections,
         )
 
@@ -395,12 +365,9 @@ class TxtLoader:
         sections = [{"heading": "", "text": p} for p in paragraphs]
         return RawDocument(
             text=text,
-            metadata={
-                "source_type": "text",
-                "source": path,
-                "title": Path(path).stem,
-                "ingested_at": datetime.now(timezone.utc).isoformat(),
-            },
+            metadata={"source_type": "text", "source": path, "title": Path(path).stem,
+                      "ingested_at": datetime.now(timezone.utc).isoformat(),
+                      **_file_times(path)},
             sections=sections,
         )
 
@@ -413,18 +380,20 @@ class TextLoader:
         return RawDocument(
             text=text,
             metadata={"source_type": "text", "source": "manual", "title": title,
-                       "ingested_at": datetime.now(timezone.utc).isoformat()},
+                      "source_fetched_at": datetime.now(timezone.utc).isoformat(),
+                      "ingested_at": datetime.now(timezone.utc).isoformat()},
             sections=sections,
         )
 
 
-def get_loader(source: str):
+def get_loader(source: str, config: RagConfig | None = None):
+    """Return (loader, kind) for a URL or file path. Web loaders receive config."""
+    cfg = config or RagConfig()
     s = source.lower()
     if source.startswith(("http://", "https://")):
-        from config import settings
-        if settings.use_playwright_requests:
-            return PlaywrightWebLoader(), "url"
-        return WebLoader(), "url"
+        if cfg.use_playwright_requests:
+            return PlaywrightWebLoader(cfg), "url"
+        return WebLoader(cfg), "url"
     elif s.endswith(".pdf"):
         return PDFLoader(), "file"
     elif s.endswith(".docx") or s.endswith(".doc"):

@@ -5,7 +5,12 @@ Ingest web pages, PDFs, DOCX files, or raw text — then ask questions grounded 
 
 ![Python](https://img.shields.io/badge/Python-3.10+-blue)
 ![Streamlit](https://img.shields.io/badge/UI-Streamlit-red)
-![LLM](https://img.shields.io/badge/LLM-Azure%20OpenAI-0078d4)
+![LLM](https://img.shields.io/badge/LLM-OpenAI%20%2F%20Azure-0078d4)
+
+> **Now a library.** Core logic lives in the importable `rag/` package — swappable
+> loaders, embedders, vector store, retrievers, rerankers, and generator wired through
+> one injectable `RagPipeline` (no global state). `app.py` and `ingest.py` are thin
+> reference clients. See [Library Usage](#library-usage).
 
 ---
 
@@ -64,7 +69,7 @@ Open `http://localhost:8501` → add sources in sidebar → start chatting.
             │                   │      │
     ┌───────▼───────────────────▼┐  ┌──▼──────────┐
     │  RETRIEVAL ENGINE          │  │  LLM CLIENT  │
-    │  • Vector search (cosine)  │  │  • Claude    │
+    │  • Vector search (cosine)  │  │  • OpenAI    │
     │  • BM25 keyword search     │  │  • Streaming │
     │  • RRF fusion              │  └──────────────┘
     │  • Cross-encoder reranker  │
@@ -133,27 +138,64 @@ Ingestion is **idempotent** — re-running the same source replaces its old chun
 
 ```
 rag_chatbot/
-├── app.py                     ← Streamlit entry point (run this)
-├── ingest.py                  ← CLI: ingest data/ folder + web_urls.txt into ChromaDB
-├── config.py                  ← All settings in one place
-├── orchestrator.py            ← Brain: intent → retrieve → confidence → generate
-├── llm_client.py              ← Anthropic Claude wrapper with streaming
+├── app.py                     ← Streamlit reference client (run this)
+├── ingest.py                  ← CLI reference client: ingest data/ + web_urls.txt
+├── pyproject.toml             ← Package metadata + optional-dependency extras
 │
-├── data/                      ← Drop files here (PDF, DOCX, CSV, XLSX, TXT)
-│   └── web_urls.txt           ← Paste website URLs here for scraping
+├── rag/                       ← The library (importable, no global state)
+│   ├── pipeline.py            ← RagPipeline facade — composes every module
+│   ├── config.py              ← RagConfig (per-instance; env supplies defaults)
+│   ├── types.py               ← ChunkRecord schema, SearchResult, Confidence, …
+│   ├── interfaces.py          ← Protocols: Embedder/VectorStore/Retriever/…
+│   ├── orchestrator.py        ← intent → retrieve → confidence → generate
+│   ├── ingest.py              ← RagIngestor: load → chunk → enrich → embed → store
+│   ├── chunking.py            ← Structure-aware chunking + parent-child
+│   ├── loaders.py             ← Web, PDF, DOCX, CSV, Excel, text loaders
+│   ├── embedders/             ← OpenAIEmbedder (Azure/OpenAI)
+│   ├── generators/            ← OpenAIGenerator (Azure/OpenAI, streaming)
+│   ├── stores/                ← ChromaVectorStore
+│   ├── keyword/               ← BM25KeywordIndex
+│   ├── retrievers/            ← dense + bm25 + RRF fusion + hybrid compose
+│   ├── rerankers/             ← cross-encoder + LLM reranker
+│   └── session_store.py       ← MongoDB chat-session persistence
 │
-├── ingestion/
-│   ├── loaders.py             ← Web, PDF, DOCX, text loaders
-│   ├── chunker.py             ← Structure-aware chunking + parent-child
-│   └── pipeline.py            ← Full ingest: load → chunk → enrich → embed → store
-│
-├── retrieval/
-│   └── engine.py              ← Vector + BM25 + RRF fusion + cross-encoder
-│
-└── requirements.txt
+├── tests/                     ← pytest suite (fakes — no API calls needed)
+└── data/                      ← Drop files here (PDF, DOCX, CSV, XLSX, TXT)
+    └── web_urls.txt           ← Paste website URLs here for scraping
 ```
 
-**10 files. No framework bloat. Every line does something.**
+**Swappable modules, one facade, no framework bloat.**
+
+---
+
+## Library Usage
+
+```python
+from rag import RagPipeline, RagConfig
+
+pipe = RagPipeline(RagConfig.from_env())     # reads .env for provider/keys
+pipe.ingest_file("report.pdf")
+pipe.ingest_url("https://docs.example.com/overview")
+
+result = pipe.query("What were Q3 revenues?")
+print(result.confidence, result.response)
+for src in result.sources:
+    print(" •", src["title"], src["score"])
+```
+
+Swap any module (or build multiple isolated pipelines in one process):
+
+```python
+from rag import RagPipeline, RagConfig
+from rag.stores.chroma import ChromaVectorStore
+
+cfg = RagConfig(collection_name="tenant_a", reranker_type="crossencoder")
+pipe = RagPipeline(config=cfg, store=ChromaVectorStore(cfg))  # inject your own Embedder/Generator/Retriever too
+```
+
+Every component (`Embedder`, `VectorStore`, `KeywordIndex`, `Retriever`, `Reranker`,
+`Generator`) is a `typing.Protocol` in `rag/interfaces.py` — implement the methods and
+pass your object in. `pip install -e ".[rerank,sessions,ui]"` pulls optional extras.
 
 ---
 
@@ -175,7 +217,7 @@ rag_chatbot/
 4. **Confidence score** — HIGH / MEDIUM / LOW / NONE based on retrieval scores
 5. **Fallback decision** — NONE → skip LLM, return "I don't know" (saves cost, prevents hallucination)
 6. **Context assemble** — dedupe, order, format chunks within token budget
-7. **LLM generate** — stream Claude's response grounded in the context
+7. **LLM generate** — stream the model's response grounded in the context
 8. **Display** — show response with confidence badge + expandable source citations
 
 ### Confidence Ladder (no dead ends)

@@ -23,7 +23,13 @@
       "Bash(.venv-wsl/bin/pip list *)",
       "Bash(npx graphify *)",
       "Bash(graphify --version)",
-      "Bash(git *)"
+      "Bash(git *)",
+      "Bash(bash *)",
+      "Bash(npm update *)",
+      "Bash(claude *)",
+      "Bash(grep -E \"^\\\\.env$|\\\\.env\\\\.example|__pycache__|chroma_db|graphify-out|\\\\.tmp\\\\.\")",
+      "Bash(.venv-wsl/bin/python -c \"import pytest; print\\('pytest', pytest.__version__\\)\")",
+      "Bash(.venv-wsl/bin/python -c \"import chromadb, openai, rank_bm25; print\\('core deps ok'\\)\")"
     ]
   }
 }

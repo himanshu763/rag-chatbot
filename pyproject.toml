@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rag-lib"
+version = "0.1.0"
+description = "Plug-and-play RAG library — swappable loaders, embedders, stores, retrievers, rerankers, generators."
+requires-python = ">=3.10"
+dependencies = [
+    "openai>=1.40.0",
+    "chromadb>=0.6.0",
+    "rank-bm25>=0.2.2",
+    "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+web = ["beautifulsoup4>=4.12.0", "requests>=2.31.0", "playwright>=1.40.0"]
+pdf = ["PyMuPDF>=1.24.0"]
+docx = ["python-docx>=1.1.0"]
+excel = ["openpyxl>=3.1.0"]
+rerank = ["sentence-transformers>=3.0.0"]
+sessions = ["pymongo>=4.6.0"]
+ui = ["streamlit>=1.35.0"]
+dev = ["pytest>=8.0.0"]
+
+[tool.setuptools.packages.find]
+include = ["rag*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

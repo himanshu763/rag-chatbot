@@ -10,10 +10,8 @@ import time
 import traceback
 import uuid
 import streamlit as st
-from ingestion.pipeline import IngestionPipeline
-from llm_client import LLMClient
-from orchestrator import Orchestrator, Confidence, CONF_META, OrchestratorResult
-from session_store import SessionStore
+from rag import RagConfig, RagPipeline, Confidence, CONF_META, OrchestratorResult
+from rag.session_store import SessionStore
 
 logging.basicConfig(
     level=logging.INFO,
@@ -27,21 +25,14 @@ _warmup_status: dict = {}          # module-level: persists across Streamlit rer
 _warmup_thread: threading.Thread | None = None
 
 
-def _run_warmup() -> None:
-    from config import settings
-    from retrieval.engine import _get_bm25_index, _get_llm_rerank_client, _get_reranker
-
-    reranker_fn = (
-        _get_llm_rerank_client if settings.reranker_type == "llm" else _get_reranker
-    )
-    for key, fn in [("bm25", _get_bm25_index), ("reranker", reranker_fn)]:
-        try:
-            fn()
-            _warmup_status[key] = "ready"
-            logger.info("Warm-up done: %s", key)
-        except Exception:
-            logger.warning("Warm-up failed: %s", key, exc_info=True)
-            _warmup_status[key] = "failed"
+def _run_warmup(pipeline: RagPipeline) -> None:
+    try:
+        status = pipeline.warmup()
+        _warmup_status.update(status)
+        logger.info("Warm-up done: %s", status)
+    except Exception:
+        logger.warning("Warm-up failed", exc_info=True)
+        _warmup_status.update({"bm25": "failed", "reranker": "failed"})
 
 
 # ── Page config ───────────────────────────────────────────────────────────────
@@ -112,37 +103,28 @@ def _new_session_id() -> str:
 
 def init_state():
     if "pipeline" not in st.session_state:
-        logger.info("Initialising IngestionPipeline...")
+        logger.info("Initialising RagPipeline...")
         try:
-            st.session_state.pipeline = IngestionPipeline()
-            logger.info("IngestionPipeline ready. Chunks in DB: %d", st.session_state.pipeline.total_chunks())
+            st.session_state.config = RagConfig.from_env()
+            st.session_state.pipeline = RagPipeline(st.session_state.config)
+            logger.info("RagPipeline ready. Chunks in DB: %d", st.session_state.pipeline.total_chunks())
         except Exception:
-            logger.exception("IngestionPipeline init failed")
-            st.error(f"ChromaDB init failed:\n```\n{traceback.format_exc()}\n```")
-            st.stop()
-
-    if "orchestrator" not in st.session_state:
-        logger.info("Initialising LLMClient + Orchestrator...")
-        try:
-            llm = LLMClient()
-            st.session_state.orchestrator = Orchestrator(llm)
-            logger.info("Orchestrator ready (model=%s)", llm.model)
-        except Exception:
-            logger.exception("LLMClient/Orchestrator init failed")
-            st.error(f"LLM init failed:\n```\n{traceback.format_exc()}\n```")
+            logger.exception("RagPipeline init failed")
+            st.error(f"Pipeline init failed:\n```\n{traceback.format_exc()}\n```")
             st.stop()
 
     global _warmup_thread
     if _warmup_thread is None:
         _warmup_status.update({"bm25": "loading", "reranker": "loading"})
-        _warmup_thread = threading.Thread(target=_run_warmup, daemon=True)
+        _warmup_thread = threading.Thread(
+            target=_run_warmup, args=(st.session_state.pipeline,), daemon=True)
         _warmup_thread.start()
         logger.info("Background warm-up started (BM25 + reranker)")
 
     if "store" not in st.session_state:
         logger.info("Initialising SessionStore...")
         try:
-            st.session_state.store = SessionStore()
+            st.session_state.store = SessionStore(st.session_state.config)
             logger.info("SessionStore ready")
         except Exception:
             logger.exception("SessionStore init failed")
@@ -169,8 +151,7 @@ def init_state():
 
 init_state()
 
-pipeline: IngestionPipeline = st.session_state.pipeline
-orchestrator: Orchestrator = st.session_state.orchestrator
+pipeline: RagPipeline = st.session_state.pipeline
 store: SessionStore = st.session_state.store
 sessions: dict = st.session_state.sessions
 current_id: str = st.session_state.current_session
@@ -308,6 +289,8 @@ for msg in messages:
                 f' · {meta.latency_ms:.0f}ms</div>',
                 unsafe_allow_html=True,
             )
+            if getattr(meta, "staleness_note", ""):
+                st.caption(f"⏳ {meta.staleness_note}")
             if meta.sources:
                 with st.expander(f"📎 {len(meta.sources)} source(s) used", expanded=False):
                     for s in meta.sources:
@@ -327,7 +310,7 @@ if prompt := st.chat_input(f"Ask a question… ({current_session['name']})"):
         placeholder = st.empty()
 
         try:
-            for chunk in orchestrator.process_stream(prompt, history):
+            for chunk in pipeline.stream(prompt, history):
                 if isinstance(chunk, str):
                     full_response += chunk
                     placeholder.markdown(full_response + "▌")
@@ -345,6 +328,8 @@ if prompt := st.chat_input(f"Ask a question… ({current_session['name']})"):
                     f' · {meta_result.latency_ms:.0f}ms</div>',
                     unsafe_allow_html=True,
                 )
+                if getattr(meta_result, "staleness_note", ""):
+                    st.caption(f"⏳ {meta_result.staleness_note}")
                 if meta_result.sources:
                     with st.expander(f"📎 {len(meta_result.sources)} source(s) used", expanded=False):
                         for s in meta_result.sources:
